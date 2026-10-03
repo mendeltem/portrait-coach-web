@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Portrait-Coach</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; background: #000; color: #fff; font-family: system-ui, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  video, #capture { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #capture { display: none; z-index: 5; }
+  /* Vollbild-Bildschirmblitz (Fallback-Signal) */
+  #flash { position: fixed; inset: 0; z-index: 3; pointer-events: none;
+           border: 14px solid transparent; transition: border-color .15s, background-color .15s; }
+  /* HUD */
+  #hud { position: fixed; left: 10px; top: 10px; z-index: 4; font-size: 13px;
+         background: rgba(0,0,0,.35); padding: 8px 10px; border-radius: 8px; line-height: 1.5; }
+  #hud .bar { display: inline-block; width: 120px; height: 8px; background: #444;
+              border-radius: 4px; vertical-align: middle; overflow: hidden; }
+  #hud .bar > i { display: block; height: 100%; width: 0; background: #0bd; }
+  #badge { position: fixed; top: 12px; right: 12px; z-index: 4; width: 64px; height: 64px;
+           border-radius: 50%; background: #c00; display: flex; align-items: center;
+           justify-content: center; font-size: 11px; font-weight: 700; text-align: center; }
+  #controls { position: fixed; left: 0; right: 0; bottom: 0; z-index: 6; display: flex;
+              gap: 8px; padding: 12px; justify-content: center; }
+  button { font-size: 15px; padding: 12px 16px; border: 0; border-radius: 12px;
+           background: #222; color: #fff; }
+  button:active { background: #444; }
+  #start { position: fixed; inset: 0; z-index: 10; background: #000; display: flex;
+           flex-direction: column; align-items: center; justify-content: center; gap: 18px; padding: 24px; text-align: center; }
+  #start button { background: #0a7; font-size: 18px; padding: 16px 28px; }
+  .hidden { display: none !important; }
+  h1 { font-size: 22px; } p { opacity: .8; font-size: 14px; max-width: 320px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted></video>
+  <img id="capture" alt="beste Pose" />
+  <div id="flash"></div>
+  <div id="hud">
+    <div id="scoreLine">Score –</div>
+    <div>Augen <span class="bar"><i data-k="eyes_open"></i></span></div>
+    <div>Lächeln <span class="bar"><i data-k="smile"></i></span></div>
+    <div>Pose <span class="bar"><i data-k="pose"></i></span></div>
+    <div>Schärfe <span class="bar"><i data-k="sharpness"></i></span></div>
+    <div>Bild <span class="bar"><i data-k="framing"></i></span></div>
+    <div id="raw" style="margin-top:6px; color:#9cf; font-size:12px;"></div>
+  </div>
+  <div id="badge">ANALYSE</div>
+  <div id="controls">
+    <button id="flip">Kamera wechseln</button>
+    <button id="retry" class="hidden">Nochmal</button>
+  </div>
+</div>
+
+<div id="start">
+  <h1>Portrait-Coach</h1>
+  <p>Hält dein Gesicht in die beste Pose. 🔴 analysiert · 🟢 perfekt → Foto.
+     Mit Rückkamera leuchtet die echte Lampe, mit Frontkamera blitzt der Bildschirm.</p>
+  <button id="go">Kamera starten</button>
+</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18";
+
+// ---- CONFIG: hier kalibrierst du, was "beste Pose" heisst ----
+const CONFIG = {
+  weights:      { eyes_open: 1.0, smile: 1.2, pose: 1.3, sharpness: 0.8, framing: 0.8 },
+  smile_target: 0.45, smile_tol: 0.35,
+  yaw_target:   12,  yaw_tol:   18,     // Grad; leichte Drehung = Dreiviertel
+  pitch_target: -4,  pitch_tol: 12,     // Grad; Kinn leicht gesenkt
+  roll_tol:     12,                     // Grad; Kopf gerade
+  sharpness_min: 25, sharpness_good: 90,
+  face_frac_target: 0.45, face_frac_tol: 0.3,
+  trigger_score: 0.85, hold_frames: 8, smooth_window: 5,
+};
+
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/" +
+                  "face_landmarker/float16/1/face_landmarker.task";
+
+const els = {
+  video: document.getElementById("video"),
+  capture: document.getElementById("capture"),
+  flash: document.getElementById("flash"),
+  badge: document.getElementById("badge"),
+  score: document.getElementById("scoreLine"),
+  raw: document.getElementById("raw"),
+  start: document.getElementById("start"),
+  go: document.getElementById("go"),
+  flip: document.getElementById("flip"),
+  retry: document.getElementById("retry"),
+};
+const bars = {};
+document.querySelectorAll("#hud .bar > i").forEach(i => bars[i.dataset.k] = i);
+
+let landmarker, stream, track, torchCapable = false;
+let facing = "user";               // "user" = Frontkamera, "environment" = Rueckkamera
+let scores = [], held = 0, running = false, lastTs = -1;
+
+const clamp01 = x => Math.max(0, Math.min(1, x));
+const band = (v, t, tol) => Math.max(0, 1 - Math.abs(v - t) / tol);
+const ramp = (v, lo, hi) => hi <= lo ? (v >= hi ? 1 : 0) : clamp01((v - lo) / (hi - lo));
+
+function eulerFromMatrix(data) {
+  // MediaPipe-Web liefert 16 Floats (spaltenweise). Rotation = obere 3x3.
+  const m = (r, c) => data[c * 4 + r];
+  const sy = Math.hypot(m(0,0), m(1,0));
+  let yaw, pitch, roll;
+  if (sy > 1e-6) {
+    pitch = Math.atan2(-m(2,0), sy);
+    yaw   = Math.atan2(m(2,1), m(2,2));
+    roll  = Math.atan2(m(1,0), m(0,0));
+  } else { pitch = Math.atan2(-m(2,0), sy); yaw = Math.atan2(-m(1,2), m(1,1)); roll = 0; }
+  const d = x => x * 180 / Math.PI;
+  return { yaw: d(yaw), pitch: d(pitch), roll: d(roll) };
+}
+
+// kleine Schaerfe-Messung (Gradient-Varianz) auf einem verkleinerten Gesichtsausschnitt
+const sc = document.createElement("canvas"), sx = sc.getContext("2d", { willReadFrequently: true });
+function sharpness(video, bb) {
+  const W = 64, H = 64;
+  sc.width = W; sc.height = H;
+  const w = (bb.x1 - bb.x0) * video.videoWidth, h = (bb.y1 - bb.y0) * video.videoHeight;
+  if (w < 4 || h < 4) return 0;
+  sx.drawImage(video, bb.x0 * video.videoWidth, bb.y0 * video.videoHeight, w, h, 0, 0, W, H);
+  const d = sx.getImageData(0, 0, W, H).data;
+  const g = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) g[i] = 0.299*d[i*4] + 0.587*d[i*4+1] + 0.114*d[i*4+2];
+  let sum = 0, sum2 = 0, n = 0;
+  for (let y = 1; y < H-1; y++) for (let x = 1; x < W-1; x++) {
+    const i = y*W + x;
+    const lap = 4*g[i] - g[i-1] - g[i+1] - g[i-W] - g[i+W];
+    sum += lap; sum2 += lap*lap; n++;
+  }
+  return sum2/n - (sum/n)*(sum/n); // Varianz
+}
+
+function computeScores(res, video) {
+  const bsArr = res.faceBlendshapes[0].categories;
+  const bs = {}; bsArr.forEach(c => bs[c.categoryName] = c.score);
+  const lm = res.faceLandmarks[0];
+
+  const blink = Math.max(bs.eyeBlinkLeft || 0, bs.eyeBlinkRight || 0);
+  const eyes_open = 1 - blink;
+  const smileRaw = ((bs.mouthSmileLeft || 0) + (bs.mouthSmileRight || 0)) / 2;
+  const smile = band(smileRaw, CONFIG.smile_target, CONFIG.smile_tol);
+
+  let yaw = 0, pitch = 0, roll = 0;
+  if (res.facialTransformationMatrixes?.length)
+    ({ yaw, pitch, roll } = eulerFromMatrix(res.facialTransformationMatrixes[0].data));
+  const pose = band(Math.abs(yaw), CONFIG.yaw_target, CONFIG.yaw_tol)
+             * band(pitch, CONFIG.pitch_target, CONFIG.pitch_tol)
+             * band(Math.abs(roll), 0, CONFIG.roll_tol);
+
+  let x0=1,y0=1,x1=0,y1=0;
+  for (const p of lm) { x0=Math.min(x0,p.x); y0=Math.min(y0,p.y); x1=Math.max(x1,p.x); y1=Math.max(y1,p.y); }
+  const bb = { x0, y0, x1, y1 };
+  const sharpVal = sharpness(video, bb);
+  const sharpness_s = ramp(sharpVal, CONFIG.sharpness_min, CONFIG.sharpness_good);
+
+  const cx = (x0+x1)/2, cy = (y0+y1)/2, frac = y1 - y0;
+  const framing = band(cx, 0.5, 0.35) * band(cy, 0.5, 0.35)
+                * band(frac, CONFIG.face_frac_target, CONFIG.face_frac_tol);
+
+  const parts = { eyes_open, smile, pose, sharpness: sharpness_s, framing };
+  const wsum = Object.values(CONFIG.weights).reduce((a,b)=>a+b,0);
+  let total = 0; for (const k in parts) total += parts[k] * CONFIG.weights[k];
+  total /= wsum;
+  return { total, parts, raw: { yaw, pitch, roll, smile: smileRaw, sharp: sharpVal, frac } };
+}
+
+async function setTorch(on) {
+  if (!torchCapable || !track) return;
+  try { await track.applyConstraints({ advanced: [{ torch: on }] }); } catch {}
+}
+
+function setState(state, total, parts, raw, heldN) {
+  const map = { RED:["#c00","ANALYSE"], YELLOW:["#c90","HALTEN"], GREEN:["#0a0","PERFEKT!"] };
+  const [col, label] = map[state];
+  els.badge.style.background = col; els.badge.textContent = label;
+  els.flash.style.borderColor = col;
+  els.flash.style.background = state === "GREEN" ? "rgba(0,170,0,.25)" : "transparent";
+  els.score.textContent = `Score ${total.toFixed(2)}  (halten ${heldN})`;
+  for (const k in parts) {
+    bars[k].style.width = Math.round(parts[k]*100) + "%";
+    bars[k].style.background = parts[k] > 0.7 ? "#0c0" : "#0bd";
+  }
+  els.raw.textContent =
+    `yaw ${raw.yaw.toFixed(0)}  pitch ${raw.pitch.toFixed(0)}  roll ${raw.roll.toFixed(0)}  ` +
+    `smile ${raw.smile.toFixed(2)}  sharp ${raw.sharp.toFixed(0)}`;
+}
+
+function loop() {
+  if (!running) return;
+  const v = els.video;
+  if (v.readyState >= 2 && v.currentTime !== lastTs) {
+    lastTs = v.currentTime;
+    const res = landmarker.detectForVideo(v, performance.now());
+    if (res.faceLandmarks?.length && res.faceBlendshapes?.length) {
+      let { total, parts, raw } = computeScores(res, v);
+      scores.push(total); if (scores.length > CONFIG.smooth_window) scores.shift();
+      total = scores.reduce((a,b)=>a+b,0) / scores.length;
+
+      let state;
+      if (total >= CONFIG.trigger_score) { state = "GREEN"; held++; }
+      else if (total >= CONFIG.trigger_score - 0.12) { state = "YELLOW"; held = 0; }
+      else { state = "RED"; held = 0; }
+
+      // Lampe/Signal: AN waehrend Analyse (rot/gelb), AUS bei bester Pose
+      setTorch(state !== "GREEN");
+      setState(state, total, parts, raw, held);
+
+      if (held >= CONFIG.hold_frames) { capture(); return; }
+    } else {
+      els.badge.textContent = "KEIN GESICHT"; scores = []; held = 0;
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+function capture() {
+  running = false;
+  setTorch(false);
+  const v = els.video, c = document.createElement("canvas");
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  const ctx = c.getContext("2d");
+  if (facing === "user") { ctx.translate(c.width, 0); ctx.scale(-1, 1); } // Selfie entspiegeln
+  ctx.drawImage(v, 0, 0);
+  els.capture.src = c.toDataURL("image/jpeg", 0.95);
+  els.capture.style.display = "block";
+  els.badge.style.background = "#0a0"; els.badge.textContent = "PERFEKT!";
+  els.retry.classList.remove("hidden");
+  if (navigator.vibrate) navigator.vibrate([80, 40, 80]);
+  stopStream();
+}
+
+function stopStream() { if (stream) stream.getTracks().forEach(t => t.stop()); stream = track = null; }
+
+async function startCamera() {
+  stopStream();
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false,
+  });
+  els.video.srcObject = stream;
+  els.video.style.transform = facing === "user" ? "scaleX(-1)" : "none"; // Spiegel bei Selfie
+  await els.video.play();
+  track = stream.getVideoTracks()[0];
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  torchCapable = !!caps.torch;
+  els.capture.style.display = "none";
+  els.retry.classList.add("hidden");
+  scores = []; held = 0; lastTs = -1; running = true;
+  requestAnimationFrame(loop);
+}
+
+async function init() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm");
+  landmarker = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
+    runningMode: "VIDEO", numFaces: 1,
+    outputFaceBlendshapes: true,
+    outputFacialTransformationMatrixes: true,
+  });
+}
+
+els.go.addEventListener("click", async () => {
+  els.go.textContent = "lädt…"; els.go.disabled = true;
+  try { await init(); await startCamera(); els.start.classList.add("hidden"); }
+  catch (e) { alert("Fehler: " + e.message); els.go.textContent = "Kamera starten"; els.go.disabled = false; }
+});
+els.flip.addEventListener("click", async () => {
+  facing = facing === "user" ? "environment" : "user";
+  try { await startCamera(); } catch (e) { alert("Kamera-Wechsel fehlgeschlagen: " + e.message); }
+});
+els.retry.addEventListener("click", () => startCamera());
+</script>
+</body>
+</html>
