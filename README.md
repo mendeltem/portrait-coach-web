@@ -1,12 +1,15 @@
 # Portrait-Coach – Web (Handy)
 
 Läuft komplett im Handy-Browser, keine App-Installation. Öffnen → Kamera
-startet → Pose wird live bewertet → bei bester Pose automatisch Foto.
+startet → **5 Sekunden Analyse** → das bestbewertete Bild wird automatisch
+gewählt und mit Statistik angezeigt.
 
-- 🔴 **ANALYSE** / 🟡 **HALTEN** / 🟢 **PERFEKT!** (Vollbild-Rand + Badge)
-- Rückkamera → echte **Blitz-Lampe** leuchtet beim Analysieren (Android)
-- Frontkamera (Selfie) → **Bildschirm-Blitz** als Signal (keine Lampe vorhanden)
-- Bei bester Pose: Foto wird angezeigt, Lampe aus, Vibration
+- Analyse-Fenster sammelt pro Frame einen Score; gemerkt wird das beste Bild.
+- Am Ende: **Statistik** (Bester Score, Durchschnitt, Min, Streuung, Frames).
+- Rückkamera → echte **Blitz-Lampe** leuchtet während der Analyse (Android).
+- Frontkamera (Selfie) → **Bildschirm-Blitz** als Signal (keine Lampe vorhanden).
+- **Foto speichern** (Android: in Galerie/teilen; sonst Download), **Nochmal**.
+- Fensterlänge über `CONFIG.session_seconds` einstellbar.
 
 Die gesamte Analyse passiert auf dem Gerät – es wird nichts hochgeladen.
 
