@@ -51,6 +51,7 @@
   <div id="badge">ANALYSE</div>
   <div id="controls">
     <button id="flip">Kamera wechseln</button>
+    <button id="save" class="hidden">Foto speichern</button>
     <button id="retry" class="hidden">Nochmal</button>
   </div>
 </div>
@@ -91,12 +92,13 @@ const els = {
   start: document.getElementById("start"),
   go: document.getElementById("go"),
   flip: document.getElementById("flip"),
+  save: document.getElementById("save"),
   retry: document.getElementById("retry"),
 };
 const bars = {};
 document.querySelectorAll("#hud .bar > i").forEach(i => bars[i.dataset.k] = i);
 
-let landmarker, stream, track, torchCapable = false;
+let landmarker, stream, track, torchCapable = false, lastBlob = null;
 let facing = "user";               // "user" = Frontkamera, "environment" = Rueckkamera
 let scores = [], held = 0, running = false, lastTs = -1;
 
@@ -229,12 +231,32 @@ function capture() {
   const ctx = c.getContext("2d");
   if (facing === "user") { ctx.translate(c.width, 0); ctx.scale(-1, 1); } // Selfie entspiegeln
   ctx.drawImage(v, 0, 0);
-  els.capture.src = c.toDataURL("image/jpeg", 0.95);
-  els.capture.style.display = "block";
+  c.toBlob(blob => {
+    lastBlob = blob;
+    els.capture.src = URL.createObjectURL(blob);
+    els.capture.style.display = "block";
+    els.save.classList.remove("hidden");
+  }, "image/jpeg", 0.95);
   els.badge.style.background = "#0a0"; els.badge.textContent = "PERFEKT!";
   els.retry.classList.remove("hidden");
   if (navigator.vibrate) navigator.vibrate([80, 40, 80]);
   stopStream();
+}
+
+async function savePhoto() {
+  if (!lastBlob) return;
+  const file = new File([lastBlob], "portrait.jpg", { type: "image/jpeg" });
+  // 1) Nativer Teilen-Dialog (Android): "In Fotos speichern" moeglich
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: "Portrait" }); return; }
+    catch (e) { if (e.name === "AbortError") return; } // Nutzer hat abgebrochen
+  }
+  // 2) Fallback: Download in den Downloads-Ordner
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(lastBlob);
+  a.download = "portrait.jpg";
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 function stopStream() { if (stream) stream.getTracks().forEach(t => t.stop()); stream = track = null; }
@@ -253,6 +275,7 @@ async function startCamera() {
   torchCapable = !!caps.torch;
   els.capture.style.display = "none";
   els.retry.classList.add("hidden");
+  els.save.classList.add("hidden");
   scores = []; held = 0; lastTs = -1; running = true;
   requestAnimationFrame(loop);
 }
@@ -277,6 +300,7 @@ els.flip.addEventListener("click", async () => {
   facing = facing === "user" ? "environment" : "user";
   try { await startCamera(); } catch (e) { alert("Kamera-Wechsel fehlgeschlagen: " + e.message); }
 });
+els.save.addEventListener("click", savePhoto);
 els.retry.addEventListener("click", () => startCamera());
 </script>
 </body>
